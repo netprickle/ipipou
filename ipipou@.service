@@ -1,0 +1,37 @@
+[Unit]
+Description=IPIP-over-UDP tunnel via ipipou for %I
+After=network-online.target nss-lookup.target
+Wants=network-online.target nss-lookup.target
+#PartOf=ipipou.target
+#Documentation=man:ipipou(8)
+Documentation=https://github.com/netprickle/ipipou
+
+[Service]
+Type=simple
+AmbientCapabilities=CAP_NET_ADMIN
+# CAP_NET_RAW required to send auth packets or reply to them. Not required if auth not in use.
+AmbientCapabilities=CAP_NET_RAW
+#AmbientCapabilities=CAP_SYS_MODULE
+# To skip CAP_SYS_MODULE in AmbientCapabilities load modules here
+ExecStartPre=+/sbin/modprobe fou
+ExecStartPre=+/sbin/modprobe ipip
+ExecStart=/usr/local/bin/ipipou --config %i --no-log-time --no-log-pid
+# Send auth packet on reload (client mode only)
+ExecReload=/bin/kill -SIGUSR1 $MAINPID
+#ExecReload=/usr/local/bin/ipipou --config %i --no-log-time --no-log-pid --reauth-only
+# To avoid ocasional cleanup failures
+KillMode=process
+TimeoutStopSec=3s
+# Consider cleanup errors as successful exit
+SuccessExitStatus=200
+# Python3 virtual environment if used
+Environment=PYTHONPATH=/usr/local/lib/ipipou
+StandardInput=null
+#ProtectHome=yes
+ProtectSystem=strict
+#User=ipipou
+#Group=ipipou
+DynamicUser=yes
+
+[Install]
+WantedBy=multi-user.target
