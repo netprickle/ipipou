@@ -154,6 +154,8 @@ If client process dies (e.g. you kill it by `kill -9 PIDofIPIPOU`) the tunnel st
     verb 2
     ```
 
+    **Keys, secret, and other options shown here only as an example, for secure setup you have to use your own!**
+
     If config has sensitive info (like private keys), it's recommended to create `ipipou` user and group, set them for `ipipou@.service`, change permissions:
     ```
     adduser --system --no-create-home --group ipipou
@@ -164,6 +166,63 @@ If client process dies (e.g. you kill it by `kill -9 PIDofIPIPOU`) the tunnel st
     ```
 
 - Run service as `systemctl start ipipou@NAME.service`
+
+
+### When ipipou is useless
+
+If both sides have public IP or behind one-to-one NAT and you do not need any auth you can create IPIP-over-FOU tunnel directly without `ipipou`:
+
+**on server side**:
+```
+# Load FOU kernel module
+modprobe fou
+
+# Create IPIP tunnel encapsulated to FOU,
+# ipip kernel module will be loaded automatically.
+ip link add name ipipou0 type ipip \
+    remote 198.51.100.2 local 203.0.113.1 \
+    encap fou encap-sport 10000 encap-dport 20001 \
+    mode ipip dev eth0
+
+# Add FOU listener for this tunnel
+ip fou add port 10000 ipproto 4 local 203.0.113.1 dev eth0
+
+# Assign IP address to the tunnel
+ip address add 172.28.0.0 peer 172.28.0.1 dev ipipou0
+
+# Up tunnel
+ip link set ipipou0 up
+```
+
+**on client side**:
+```
+modprobe fou
+
+ip link add name ipipou1 type ipip \
+    remote 203.0.113.1 local 192.168.0.2 \
+    encap fou encap-sport 10001 encap-dport 10000 encap-csum \
+    mode ipip dev eth0
+
+# Options "local", "peer", "peer_port", "dev" can be not supported by old kernels and can be skipped.
+ip fou add port 10001 ipproto 4 local 192.168.0.2 peer 203.0.113.1 peer_port 10000 dev eth0
+
+ip address add 172.28.0.1 peer 172.28.0.0 dev ipipou1
+
+ip link set ipipou1 up
+```
+
+**where**:
+- `ipipou*` — tunnel interface name
+- `203.0.113.1` — server public IP
+- `198.51.100.2` — client public IP
+- `192.168.0.2` — client IP assigned to `eth0`
+- `10001` — client local FOU port
+- `20001` — client public FOU port
+- `10000` — server public FOU port
+- `encap-csum` — an option to add checksum to inner UDP packets; can be replaced with `noencap-csum` to avoid calculation and keep it empty, packets integrity will be controlled by outer UDP layer (while the packet is in the tunnel).
+- `eth0` — local base interface for the tunnel
+- `172.28.0.1` — tunnel client private IP address
+- `172.28.0.0` — tunnel server private IP address
 
 
 ## Troubleshooting
@@ -180,6 +239,11 @@ If client process dies (e.g. you kill it by `kill -9 PIDofIPIPOU`) the tunnel st
 - If you want to cleanup your system from all interfaces created by `ipipou` (like `tunl0`, or `ipipou*` in case if automatic cleanup failed) you may run `modprobe -r fou ipip; nft delete table ip ipipou`
 
 - `ipipou` configuration of `nftables` should be fully compatible with your existing `iptables` configuration, `nftables` and `iptables` configurations can coexist. But in case if you use separate service for `nftables` managing, on service restart/reload `ip ipipou` table might be flushed, so the script may turn to inconsistent state. Be sure to keep `ip ipipou` table intact. It affects only server mode.
+
+
+## References
+
+- Review article in habr.com (Russian): [ipipou: больше чем просто нешифрованный туннель](https://habr.com/ru/post/522396/)
 
 
 In case if you found a bug or have reasonable feature request feel free to create an issue or PR.
