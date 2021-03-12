@@ -5,21 +5,38 @@ Utility to create ipipou tunnels (IPIP over UDP [FOU]).
 Optionally remote ip:port authentication can be enabled using supported
 authentication modes.
 
-It must have the following capabilities:
+It must be run from root or have the following capabilities:
   CAP_NET_ADMIN - to create and configure network interfaces
   CAP_NET_RAW - if authentication packets sending required
   CAP_SYS_MODULE - if "fou" and "ipip" modules are not loaded yet
 
-In client mode SIGUSR1 signal initiate auth resend to the server (the same way
+In client mode SIGUSR1 signal initiates auth resend to the server (the same way
 as --reauth-only option do).
 
 On SIGTERM or SIGINT cleanup (deconfiguration) will be initiated first.
+
+Program exit codes with specific meaning:
+  0: ok
+  1: generic
+  2: argparse
+ 10: modprobe
+ 20: nfq
+ 40: nftables
+ 51: ip_address
+ 52: ip_link
+ 53: ip_fou
+100: ipipou_create
+101: ipipou_update
+120: send_auth
+127: not_implemented
+200: cleanup
 '''
 
 from base64 import b64decode, b64encode
 from datetime import datetime, timezone, timedelta
 from time import sleep
 import fcntl
+import gc
 import ipaddress
 import logging
 import os
@@ -29,15 +46,16 @@ import struct
 import subprocess
 import sys
 import traceback
-#import netfilterqueue as nfq                       # Will be imported for server mode only
-#from nacl.signing import SigningKey, VerifyingKey  # Will be imported for AUTH_KEY mode only
-#from nacl.exceptions import BadSignatureError      # Will be imported for AUTH_KEY mode only
+#import argparse                                 # Will be imported if run as a command
+#import netfilterqueue as nfq                    # Will be imported for server mode only
+#from nacl.signing import SigningKey, VerifyKey  # Will be imported for AUTH_KEY mode only
+#from nacl.exceptions import BadSignatureError   # Will be imported for AUTH_KEY mode only
 
 # TODO: Use python native bindings instead of subprocess: libnl, netlink, pyroute2, ...?
 
 # pylint:disable=undefined-variable,used-before-assignment,global-statement,global-variable-undefined,subprocess-run-check,too-many-branches
 
-# Some global defaults
+# Some global defaults/initial values
 tunl_ip_base = '172.28.0.0'  # Default base TUNL_IP (when N == 0)
 fou_ip_alt_base = '172.29.0.0'  # Default base FOU_IP_ALT (when N == 0)
 fou_port_base = 10000  # Default base FOU_PORT (when N == 0)
@@ -45,52 +63,44 @@ nfq_range = None  # How many bytes of the packet to get. None to full packet.
 fou_ip = None  # Current FOU local IP, will be filled with one of FOU_IP_MAIN or FOU_IP_ALT
 last_remote_ip = None  # Last remembered FOU remote IP (str)
 last_remote_port = None  # Last remembered FOU remote PORT (int)
-last_remote_timestamp = None  # The time when last_remote_* was remembered
+last_remote_timestamp = None  # The time when last_remote_ip:last_remote_port was remembered
 own_fou = None  # If FOU listener was created by this script
 own_fou_ip_alt = None  # If FOU alt IP was added by this script
 ip_fou_unsupported_local = None  # If `ip fou` supports "local" and "dev" arguments. None to autodetect.
-exit_codes = {
-    'ok': 0,
-    'general': 1,
-    'argparse': 2,
-    'modprobe': 10,
-    'nfq': 20,
-    'nftables': 40,
-    'ip_address': 51,
-    'ip_link': 52,
-    'ip_fou': 53,
-    'ipipou_create': 100,
-    'ipipou_update': 101,
-    'send_auth': 120,
-    'not_implemented': 127,
-    'cleanup': 200,
-}
 returncode = 0  # Default return code (ok)
 
 
-def cleanup_and_exit(signalnum=None, frame=None, returncode=0):
+def cleanup_and_exit(signalnum=None, frame=None, rcode=0):
     '''
     Cleanup and exit gracefully.
     '''
+
     if signalnum is None:
         log.info('Cleanup and exit')
     else:
-        log.info('Cleanup and exit on %s (%s)', signal.Signals(signalnum).name, signalnum)
+        log.info('Cleanup and exit on %s (%s)', signal.Signals(signalnum).name, signalnum)  # pylint:disable=no-member
     try:
         Q.unbind()
     except Exception:
         pass
-    if not ipipou_delete() and returncode == 0:
-        returncode = exit_codes['cleanup']
-    sys.exit(returncode)
+    if not ipipou_delete() \
+    and rcode == 0:
+        rcode = 200  # cleanup error exit code
+
+    sys.exit(rcode)
 
 
 def sigignore(signalnum=None, frame=None):
-    log.info('%s: ignored', signal.Signals(signalnum).name)
+    '''
+    This function should be called when some signal is ignored explicitly.
+    '''
+    log.info('%s: ignored', signal.Signals(signalnum).name)  # pylint:disable=no-member
 
 
 def prerequisites():
-    '''General script requirements'''
+    '''
+    General script requirements
+    '''
     # Be sure "fou" kernel module is loaded.
     # "ipip" module will be loaded automatically on tunnel creation if supported.
     fou_loaded = None
@@ -104,47 +114,64 @@ def prerequisites():
     except Exception as e:
         log.debug('Failed to read /proc/modules: %s', e)
     if not fou_loaded:
+        cmd = ('modprobe', 'fou')
+        log.debug('call: %s', cmd)
         try:
-            cmd = ('modprobe', 'fou')
-            log.debug('call: %s', cmd)
-            p = subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
-            if p.returncode:
-                log.fatal('Failed to load module: fou: %s', p.stderr)
-                sys.exit(exit_codes['modprobe'])
-            log.debug('Loaded module: fou')
+            subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=5, check=True)
         except FileNotFoundError:
             log.fatal('Executable not found: modprobe')
-            sys.exit(exit_codes['modprobe'])
+            sys.exit(10)  # modprobe error exit code
+        except subprocess.CalledProcessError as e:
+            log.fatal('Failed to load module: fou: %s', e.stderr)
+            sys.exit(10)  # modprobe error exit code
+        except Exception as e:
+            log.fatal('Failed to load module: fou: %s', e)
+            sys.exit(10)  # modprobe error exit code
+        else:
+            log.debug('Loaded module: fou')
 
     if MODE == 'server':
         # Be sure that required nftables base chains exists
-        try:
-            # May not be able to add table with chains on single call, so add sequentially.
-            # Add table
-            cmd = ('nft', '--', 'add table ip', NFT_TABLE, ';')
-            log.debug('call: %s', cmd)
-            p = subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
-            if p.returncode:
-                log.fatal('Failed to add nftables table %s: %s', NFT_TABLE, p.stderr)
-                sys.exit(exit_codes['nftables'])
-            log.debug('Added nftables table %s', NFT_TABLE)
 
-            # Add chains
-            cmd = ('nft', '--',
-                # 'add table ip', NFT_TABLE, ';',
-                'add chain ip', NFT_TABLE, 'nat-prerouting { type nat hook prerouting priority -42 ; } ;',
-                'add chain ip', NFT_TABLE, 'nfq { type nat hook prerouting priority -41 ; } ;',
-                'add chain ip', NFT_TABLE, 'nat-postrouting { type nat hook postrouting priority -42 ; } ;',
-            )
-            log.debug('call: %s', cmd)
-            p = subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
-            if p.returncode:
-                log.fatal('Failed to add nftables chains to table %s (nat-prerouting, nfq, nat-postrouting): %s', NFT_TABLE, p.stderr)
-                sys.exit(exit_codes['nftables'])
-            log.debug('Added nftables chains to table %s (nat-prerouting, nfq, nat-postrouting).', NFT_TABLE)
+        # May not be able to add table with chains on single call, so add sequentially.
+        # Add table
+        cmd = ('nft', '--', 'add table ip', NFT_TABLE, ';')
+        log.debug('call: %s', cmd)
+        try:
+            subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=5, check=True)
         except FileNotFoundError:
             log.fatal('Executable not found: nft')
-            sys.exit(exit_codes['nftables'])
+            sys.exit(40)  # nftables error exit code
+        except subprocess.CalledProcessError as e:
+            log.fatal('Failed to add nftables table %s: %s', NFT_TABLE, e.stderr)
+            sys.exit(40)  # nftables error exit code
+        except Exception as e:
+            log.fatal('Failed to add nftables table %s: %s', NFT_TABLE, e)
+            sys.exit(40)  # nftables error exit code
+        else:
+            log.debug('Added nftables table %s', NFT_TABLE)
+
+        # Add chains
+        cmd = ('nft', '--',
+            # 'add table ip', NFT_TABLE, ';',
+            'add chain ip', NFT_TABLE, 'nat-prerouting { type nat hook prerouting priority -42 ; } ;',
+            'add chain ip', NFT_TABLE, 'nfq { type nat hook prerouting priority -41 ; } ;',
+            'add chain ip', NFT_TABLE, 'nat-postrouting { type nat hook postrouting priority -42 ; } ;',
+        )
+        log.debug('call: %s', cmd)
+        try:
+            subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=5, check=True)
+        except FileNotFoundError:
+            log.fatal('Executable not found: nft')
+            sys.exit(40)  # nftables error exit code
+        except subprocess.CalledProcessError as e:
+            log.fatal('Failed to add nftables chains to table %s: %s', NFT_TABLE, e.stderr)
+            sys.exit(40)  # nftables error exit code
+        except Exception as e:
+            log.fatal('Failed to add nftables chains to table %s: %s', NFT_TABLE, e)
+            sys.exit(40)  # nftables error exit code
+        else:
+            log.debug('Added nftables chains to table %s', NFT_TABLE)
 
 
 def client_init(monitor=False):
@@ -164,51 +191,58 @@ def client_init(monitor=False):
         cmd.append('encap-csum')
     elif ENCAP_CSUM is False:
         cmd.append('noencap-csum')
-    cmd += ('mode', 'ipip')
+    cmd.extend(('mode', 'ipip'))
     if FOU_DEV:
-        cmd += ('dev', FOU_DEV)
+        cmd.extend(('dev', FOU_DEV))
     log.debug('call: %s', cmd)
-    p = subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
-    if p.returncode == 0:
-        log.debug('%s created', TUNL_DEV)
+    try:
+        subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=5, check=True)
+    except FileNotFoundError:
+        log.fatal('Executable not found: ip')
+        cleanup_and_exit(rcode=52)  # ip_link error exit code
+    except subprocess.CalledProcessError as e:
+        log.error('Failed to create %s: %s', TUNL_DEV, e.stderr)
+        cleanup_and_exit(rcode=52)  # ip_link error exit code
+    except Exception as e:
+        log.error('Failed to create %s: %s', TUNL_DEV, e)
+        cleanup_and_exit(rcode=52)  # ip_link error exit code
     else:
-        log.error('Failed to create %s: %s', TUNL_DEV, p.stderr)
-        returncode = exit_codes['ip_link']
-        cleanup_and_exit()
-        # sys.exit(returncode)
+        log.debug('%s created', TUNL_DEV)
 
     if not fou_listener_create():
-        returncode = exit_codes['ip_fou']
-        cleanup_and_exit()
-        # sys.exit(returncode)
+        cleanup_and_exit(rcode=53)  # ip_fou error exit code
 
     # Assign IP to TUNL_DEV
     cmd = ('ip', 'address', 'add', str(TUNL_IP), 'peer', str(TUNL_PEER_IP), 'dev', TUNL_DEV)
     log.debug('call: %s', cmd)
-    p = subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
-    if p.returncode:
-        log.error('Failed to assign IP to %s: %s', TUNL_DEV, p.stderr)
-        returncode = exit_codes['ip_address']
-        cleanup_and_exit()
-        # sys.exit(returncode)
-    log.debug('Assigned IP to %s: %s/%s', TUNL_DEV, TUNL_IP, TUNL_PEER_IP)
+    try:
+        subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=5, check=True)
+    except subprocess.CalledProcessError as e:
+        log.error('Failed to assign IP to %s: %s', TUNL_DEV, e.stderr)
+        cleanup_and_exit(rcode=51)  # ip_address error exit code
+    except Exception as e:
+        log.error('Failed to assign IP to %s: %s', TUNL_DEV, e)
+        cleanup_and_exit(rcode=51)  # ip_address error exit code
+    else:
+        log.debug('Assigned IP to %s: %s/%s', TUNL_DEV, TUNL_IP, TUNL_PEER_IP)
 
     # Bring up TUNL_DEV
     cmd = ('ip', 'link', 'set', TUNL_DEV, 'up')
     log.debug('call: %s', cmd)
-    p = subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
-    if p.returncode:
-        log.error('Failed to bring up %s: %s', TUNL_DEV, p.stderr)
-        returncode = exit_codes['ip_link']
-        cleanup_and_exit()
-        # sys.exit(returncode)
-    log.debug('%s brought up', TUNL_DEV)
+    try:
+        subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=5, check=True)
+    except subprocess.CalledProcessError as e:
+        log.error('Failed to bring up %s: %s', TUNL_DEV, e.stderr)
+        cleanup_and_exit(rcode=52)  # ip_link error exit code
+    except Exception as e:
+        log.error('Failed to bring up %s: %s', TUNL_DEV, e)
+        cleanup_and_exit(rcode=52)  # ip_link error exit code
+    else:
+        log.debug('%s brought up', TUNL_DEV)
 
     # Authenticate on server, send UDP auth packet.
     if not client_auth():
-        returncode = exit_codes['send_auth']
-        cleanup_and_exit()
-        # sys.exit(returncode)
+        cleanup_and_exit(rcode=120)  # send_auth error exit code
 
     log.info('Setup completed for %s%s: %s:%s<->%s:%s', TUNL_DEV, '@'+FOU_DEV if FOU_DEV else '', fou_ip, FOU_PORT, FOU_REMOTE_IP, FOU_REMOTE_PORT)
 
@@ -219,7 +253,7 @@ def client_init(monitor=False):
 
     # Catch SIGUSR1 for auth resend
     def sigusr1(signalnum=None, frame=None):
-        log.info('SIGUSR1: send auth packet')
+        log.info('SIGUSR1: sending auth packet')
         client_auth()
     signal.signal(signal.SIGUSR1, sigusr1)
 
@@ -230,9 +264,7 @@ def client_init(monitor=False):
     if monitor:
         # TODO: implement monitoring: check periodically if tunnel is alive (by ping?) and if not resend auth packet.
         log.error('Monitor mode is not implemented yet')
-        returncode = exit_codes['not_implemented']
-        cleanup_and_exit()
-        # sys.exit(returncode)
+        cleanup_and_exit(rcode=127)  # not_implemented error exit code
 
     if KEEPALIVE_SEC > 0:
         # Send auth packets every KEEPALIVE_SEC
@@ -244,11 +276,11 @@ def client_init(monitor=False):
         while True:  # Loop to allow other signals processing like SIGUSR1
             signal.pause()
 
-    sys.exit(returncode)
-
 
 def client_auth():
-    '''Send auth packet to the server'''
+    '''
+    Send auth packet to the server
+    '''
     # Set udp_payload depends on auth type
     if AUTH_TOKEN:
         udp_payload = AUTH_TOKEN
@@ -261,14 +293,16 @@ def client_auth():
             udp_payload = sig+timestamp+salt
         else:
             log.error('Unsupported AUTH_KEY_TYPE: %s', AUTH_KEY_TYPE)
-            sys.exit(exit_codes['not_implemented'])
+            cleanup_and_exit(rcode=127)  # not_implemented error exit code
     else:
         udp_payload = b''
 
     log.debug('Sending auth packet')
     return send_raw_packet(
-        dst_ip=FOU_REMOTE_IP, dst_port=FOU_REMOTE_PORT,
-        src_ip=fou_ip or FOU_IP_MAIN, src_port=FOU_PORT,
+        dst_ip=FOU_REMOTE_IP,
+        dst_port=FOU_REMOTE_PORT,
+        src_ip=fou_ip or FOU_IP_MAIN,
+        src_port=FOU_PORT,
         payload=udp_payload,
         ttl=AUTH_PACKET_TTL,
     )
@@ -284,24 +318,28 @@ def queue_init(nft_pre_verdict_statement='', nft_queue_flags=''):
 
     cmd = ['nft', '--', 'add', 'rule', 'ip', NFT_TABLE, 'nfq']
     if FOU_DEV:
-        cmd += ('iifname', '"%s"' % FOU_DEV)
-    cmd += ('ip', 'daddr', str(FOU_IP_MAIN), 'udp', 'dport', str(FOU_PORT))
+        cmd.extend(('iifname', '"%s"' % FOU_DEV))
+    cmd.extend(('ip', 'daddr', str(FOU_IP_MAIN), 'udp', 'dport', str(FOU_PORT)))
     if nft_pre_verdict_statement:
         cmd.append(nft_pre_verdict_statement)
     if NFT_COUNTER:
         cmd.append('counter')
-    cmd += ('queue', 'num', str(NFQ_NUM))
+    cmd.extend(('queue', 'num', str(NFQ_NUM)))
     if nft_queue_flags:
         cmd.append(nft_queue_flags)
     log.debug('call: %s', cmd)
-    p = subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
-    if p.returncode:
-        log.fatal('Failed to add nftables queue rule: %s', p.stderr)
-        sys.exit(exit_codes['nftables'])
+    try:
+        subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=5, check=True)
+    except subprocess.CalledProcessError as e:
+        log.fatal('Failed to add nftables queue rule: %s', e.stderr)
+        cleanup_and_exit(rcode=40)  # nftables error exit code
+    except Exception as e:
+        log.fatal('Failed to add nftables queue rule: %s', e)
+        cleanup_and_exit(rcode=40)  # nftables error exit code
 
     # Catch some signals for clean exit
     signal.signal(signal.SIGTERM, cleanup_and_exit)
-    signal.signal(signal.SIGALRM, lambda s, f: cleanup_and_exit(s, f, returncode=returncode))  # To exit from queue_handler call with proper returncode
+    signal.signal(signal.SIGALRM, lambda s, f: cleanup_and_exit(s, f, rcode=returncode))  # To exit from queue_handler call with proper returncode
 
     # Ignore some signals
     signal.signal(signal.SIGUSR1, sigignore)
@@ -309,16 +347,16 @@ def queue_init(nft_pre_verdict_statement='', nft_queue_flags=''):
     signal.signal(signal.SIGHUP,  sigignore)
 
     Q = nfq.NetfilterQueue()
-    if nfq_range:
-        Q.bind(NFQ_NUM, queue_handler, NFQ_MAX_LEN, nfq.COPY_PACKET, nfq_range)
-    else:
+    if nfq_range is None:
         Q.bind(NFQ_NUM, queue_handler, NFQ_MAX_LEN, nfq.COPY_PACKET)
+    else:
+        Q.bind(NFQ_NUM, queue_handler, NFQ_MAX_LEN, nfq.COPY_PACKET, nfq_range)
 
     # Main run loop
     try:
-        # TODO: run in separate thread?
         # if KEEPALIVE_SEC > 0:
         #     # Send keepalive packets every KEEPALIVE_SEC
+        #     # TODO: run in separate thread?
         #     while True:
         #         sleep(KEEPALIVE_SEC)
         #         if FOU_REMOTE_IP:
@@ -329,7 +367,9 @@ def queue_init(nft_pre_verdict_statement='', nft_queue_flags=''):
         #                 ttl=AUTH_PACKET_TTL,
         #             )
 
-        log.info('Running netfilter queue %s for %s:%s.udp%s...', NFQ_NUM, FOU_IP_MAIN, FOU_PORT, '@'+FOU_DEV if FOU_DEV else '')
+        log.info('Running netfilter queue %s for %s:%s.udp%s...',
+            NFQ_NUM, FOU_IP_MAIN, FOU_PORT, '@'+FOU_DEV if FOU_DEV else '',
+        )
         Q.run(block=True)
     except KeyboardInterrupt as e:
         log.info('Exit netfilter queue %s by %s', NFQ_NUM, e.__class__.__name__)
@@ -339,15 +379,18 @@ def queue_init(nft_pre_verdict_statement='', nft_queue_flags=''):
     except Exception as e:
         log.info('Exit netfilter queue %s by %s', NFQ_NUM, e.__class__.__name__)
         log.debug(traceback.format_exc())
-        returncode = exit_codes['nfq']
-    cleanup_and_exit(returncode=returncode)
+        returncode = 20  # nfq error exit code
+    cleanup_and_exit(rcode=returncode)
 
 
 def queue_handler(pkt):
     '''
     Netfilter queue packets handler.
-    It's the only performance critical function, so avoid heavy calculations here if possible.
-    It authenticates packet and create/update tunnel accordingly.
+
+    It's the only performance critical function, so avoid heavy calculations
+    here (and in functions called from here) if possible.
+
+    It authenticates packet and creates/updates tunnel accordingly.
     Supported auth:
       - remote IP and/or PORT (if FOU_REMOTE_IP and/or FOU_REMOTE_PORT specified)
       - UDP payload
@@ -382,14 +425,14 @@ def queue_handler(pkt):
 
     # Accept packet for closest followers of the auth packet
     # or if connection is expired but related to the last remembered remote with acceptable lifetime
-    if last_remote_ip == src_ip \
-    and last_remote_port == src_udp_port:
+    if last_remote_port == src_udp_port \
+    and last_remote_ip == src_ip:
         if AUTH_LIFETIME_SEC > 0 \
         and last_remote_timestamp + timedelta(seconds=AUTH_LIFETIME_SEC) < datetime.now():
             log.debug('Auth lifetime is expired for the last remembered remote %s:%s', src_ip, src_udp_port)
         else:
-            log.debug('Accept packet: the last remembered remote %s:%s match', src_ip, src_udp_port)
             pkt.accept()
+            log.debug('Accept packet: the last remembered remote %s:%s match', src_ip, src_udp_port)
             # Update last_remote_timestamp if it's auth packet
             if auth_is_valid(src_ip, src_udp_port, src_udp_payload, mute=True):
                 last_remote_timestamp = datetime.now()
@@ -398,17 +441,18 @@ def queue_handler(pkt):
 
     # Authenticate
     if not auth_is_valid(src_ip, src_udp_port, src_udp_payload):
-        log.debug('Drop packet (auth error)')
         pkt.drop()
+        log.debug('Drop packet (auth error)')
         return
 
-    log.info('Drop packet (auth ok)')
     pkt.drop()  # The packet achieved its goal, so drop it right now, there is no other destination.
+    log.info('Drop packet (auth ok)')
 
-    if FOU_REMOTE_IP or FOU_REMOTE_PORT:
-        log.debug('FOU remote changed from %s:%s to %s:%s', FOU_REMOTE_IP, FOU_REMOTE_PORT, src_ip, src_udp_port)
-    else:
+    if FOU_REMOTE_IP is None \
+    or FOU_REMOTE_PORT is None:
         log.debug('FOU remote set to %s:%s', src_ip, src_udp_port)
+    else:
+        log.debug('FOU remote changed from %s:%s to %s:%s', FOU_REMOTE_IP, FOU_REMOTE_PORT, src_ip, src_udp_port)
     FOU_REMOTE_IP = ipaddress.IPv4Address(src_ip)
     FOU_REMOTE_PORT = src_udp_port
 
@@ -417,7 +461,7 @@ def queue_handler(pkt):
             if fou_ip == FOU_IP_MAIN:  # For alt IP it breaks NAT
                 # Add connection manually, because original packet was dropped, so was not tracked.
                 # It's optional but helps to avoid next packet to be queued, also increases connection timeout.
-                cmd = ['conntrack', '--create',
+                cmd = ('conntrack', '--create',
                     '--timeout', '120',
                     '--status', 'ASSURED,ASSURED',
                     '--proto', 'udp',
@@ -426,35 +470,33 @@ def queue_handler(pkt):
                     '--orig-dst', str(FOU_IP_MAIN), '--reply-src', str(fou_ip),
                     '--orig-port-dst', str(FOU_PORT), '--reply-port-src', str(FOU_PORT),
                     # '--mark', '0',
-                ]
+                )
                 # if fou_ip == FOU_IP_ALT:
                 #     cmd.append('--dst-nat')
                 log.debug('call: %s', cmd)
                 try:
-                    p = subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
-                    if p.returncode:
-                        log.info('Failed to track outer connection for %s: %s', TUNL_DEV, p.stderr)
-                    else:
-                        log.debug('Outer connection tracked for %s', TUNL_DEV)
+                    subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=2, check=True)
                 except FileNotFoundError:
                     log.info('Executable not found: conntrack')
+                except subprocess.CalledProcessError as e:
+                    log.info('Failed to track outer connection for %s: %s', TUNL_DEV, e.stderr)
+                except Exception as e:
+                    log.info('Failed to track outer connection for %s: %s', TUNL_DEV, e)
+                else:
+                    log.debug('Outer connection tracked for %s', TUNL_DEV)
         else:
             log.error('Failed to create %s for remote %s:%s, signaling for exit.', TUNL_DEV, FOU_REMOTE_IP, FOU_REMOTE_PORT)
-            # sys.exit(exit_codes['ipipou_create'] if returncode == 0 else returncode)
             # Any exception from this handler will be ignored, so use signals instead of sys.exit
             if returncode == 0:  # Do not overwrite original returncode if any
-                returncode = exit_codes['ipipou_create']
+                returncode = 100  # ipipou_create error exit code
             signal.alarm(1)
             return
     else:  # Subsequent auth packet, need to update tunnel FOU_REMOTE_IP:FOU_REMOTE_PORT
-        if ipipou_update():
-            pass
-        else:
+        if not ipipou_update():
             log.error('Failed to update %s for remote %s:%s, signaling for exit.', TUNL_DEV, FOU_REMOTE_IP, FOU_REMOTE_PORT)
-            # sys.exit(exit_codes['ipipou_update'] if returncode == 0 else returncode)
             # Any exception from this handler will be ignored, so use signals instead of sys.exit
             if returncode == 0:  # Do not overwrite original returncode if any
-                returncode = exit_codes['ipipou_update']
+                returncode = 101  # ipipou_update error exit code
             signal.alarm(1)
             return
 
@@ -469,15 +511,17 @@ def queue_handler(pkt):
                 udp_payload = sig+timestamp+salt
             else:
                 log.error('Unsupported AUTH_KEY_TYPE: %s', AUTH_KEY_TYPE)
-                returncode = exit_codes['not_implemented']
+                returncode = 127  # not_implemented error exit code
                 signal.alarm(1)
                 return
         else:
             udp_payload = src_udp_payload[::-1]  # Original payload reverse
 
         send_raw_packet(
-            dst_ip=FOU_REMOTE_IP, dst_port=FOU_REMOTE_PORT,
-            src_ip=fou_ip, src_port=FOU_PORT,
+            dst_ip=FOU_REMOTE_IP,
+            dst_port=FOU_REMOTE_PORT,
+            src_ip=fou_ip or FOU_IP_MAIN,
+            src_port=FOU_PORT,
             payload=udp_payload,
             ttl=AUTH_PACKET_TTL,
         )
@@ -485,7 +529,7 @@ def queue_handler(pkt):
     last_remote_ip = src_ip
     last_remote_port = src_udp_port
     last_remote_timestamp = datetime.now()
-    log.debug('Remembered remote: %s:%s', src_ip, src_udp_port)
+    log.debug('Remembered remote: %s:%s', last_remote_ip, last_remote_port)
 
 
 def auth_is_valid(src_ip, src_udp_port, src_udp_payload=b'', mute=False):
@@ -495,24 +539,29 @@ def auth_is_valid(src_ip, src_udp_port, src_udp_payload=b'', mute=False):
     # [Pre]authenticate by remote ip and/or port if specified
     if AUTH_BY_REMOTE_IP:
         if str(FOU_REMOTE_IP) != src_ip:
-            if mute is False: log.debug('Auth: src IP %s did not match %s but AUTH_BY_REMOTE_IP set', src_ip, FOU_REMOTE_IP)
+            if not mute:
+                log.debug('Auth: src IP %s did not match %s but AUTH_BY_REMOTE_IP set', src_ip, FOU_REMOTE_IP)
             return False
     if AUTH_BY_REMOTE_PORT:
         if FOU_REMOTE_PORT != src_udp_port:
-            if mute is False: log.debug('Auth: src port %s did not match %s but AUTH_BY_REMOTE_PORT set', src_udp_port, FOU_REMOTE_PORT)
+            if not mute:
+                log.debug('Auth: src port %s did not match %s but AUTH_BY_REMOTE_PORT set', src_udp_port, FOU_REMOTE_PORT)
             return False
 
     # Then check payload based auth if required
     if AUTH_TOKEN:
         if AUTH_TOKEN == src_udp_payload:
-            if mute is False: log.info('Auth: %s:%s authenticated successfully by token for %s', src_ip, src_udp_port, TUNL_DEV)
+            if not mute:
+                log.info('Auth: %s:%s authenticated successfully by token for %s', src_ip, src_udp_port, TUNL_DEV)
             return True
-        if mute is False: log.debug('Auth: outer UDP payload did not match AUTH_TOKEN')
+        if not mute:
+            log.debug('Auth: outer UDP payload did not match AUTH_TOKEN')
     elif AUTH_REMOTE_PUBKEY:
         # Expected UDP payload format: Signature (64 bytes) + Unix time UTC timestamp (5 bytes) + salt (4 bytes)
         # TODO: optionally include client public IP to signed message
         if len(src_udp_payload) < 73:  # 64+5+4
-            if mute is False: log.info('Auth: %s:%s invalid UDP payload length for %s', src_ip, src_udp_port, TUNL_DEV)
+            if not mute:
+                log.info('Auth: %s:%s invalid UDP payload length for %s', src_ip, src_udp_port, TUNL_DEV)
             return False
         sig = src_udp_payload[:64]  # Signature
         msg = src_udp_payload[64:] + AUTH_SECRET  # Message. Trailing secret assumed in message.
@@ -525,73 +574,88 @@ def auth_is_valid(src_ip, src_udp_port, src_udp_payload=b'', mute=False):
                 utc_now = int(datetime.now(tz=timezone.utc).timestamp())
                 abs_timedelta = abs(utc_now-timestamp)
                 if abs_timedelta > AUTH_MAX_TIME_DISCREPANCY_SEC:
-                    if mute is False: log.info('Auth: %s:%s not an auth packet or too high time discrepancy for %s: %ss', src_ip, src_udp_port, TUNL_DEV, abs_timedelta)
+                    if not mute:
+                        log.info('Auth: %s:%s not an auth packet or too high time discrepancy for %s: %ss', src_ip, src_udp_port, TUNL_DEV, abs_timedelta)
                     return False
 
             try:
                 # AUTH_REMOTE_PUBKEY.verify(sig, msg)
                 AUTH_REMOTE_PUBKEY.verify(msg, sig)
             except BadSignatureError:
-                if mute is False: log.info('Auth: %s:%s invalid signature for %s', src_ip, src_udp_port, TUNL_DEV)
+                if not mute:
+                    log.info('Auth: %s:%s invalid signature for %s', src_ip, src_udp_port, TUNL_DEV)
             except Exception as e:
-                if mute is False: log.warning('Auth: %s:%s authentication error for %s: %s', src_ip, src_udp_port, TUNL_DEV, e)
+                if not mute:
+                    log.warning('Auth: %s:%s authentication error for %s: %s', src_ip, src_udp_port, TUNL_DEV, e)
             else:
-                if mute is False: log.info('Auth: %s:%s authenticated successfully by ed25519 pubkey for %s', src_ip, src_udp_port, TUNL_DEV)
+                if not mute:
+                    log.info('Auth: %s:%s authenticated successfully by ed25519 pubkey for %s', src_ip, src_udp_port, TUNL_DEV)
                 return True
         # elif AUTH_KEY_TYPE == 'another':
         #     pass
         else:
-            if mute is False: log.warning('Unsupported AUTH_KEY_TYPE: %s', AUTH_KEY_TYPE)
+            if not mute:
+                log.warning('Unsupported AUTH_KEY_TYPE: %s', AUTH_KEY_TYPE)
             return False
     else:
         return True
 
-    # Auth failure can happen for clients behind NAT when connection expired
-    # and client's public src port changed, then client sends data packet
-    # using new connection, server treat it as auth attempt. Active reply
-    # about auth failure may help if client expect such replies (see
+    # Auth failure can happen for clients behind NAT when connection is
+    # expired and client's public src port changed, then client sends data
+    # packet using new connection, server treat it as auth attempt. Active
+    # reply about auth failure may help if client expects such replies (see
     # REPLY_ON_AUTH_FAILURE and monitor mode). Or client have to keep
-    # connection alive and/or monitor disconnections with consequent
-    # reauth.
+    # connection alive and/or monitor disconnections with consequent reauth.
     return False
 
 
 def fou_listener_create():
-    '''Create fou listener if does not exist'''
+    '''
+    Create fou listener if does not exist
+    '''
     global ip_fou_unsupported_local
     global own_fou
 
     cmd = ['ip', 'fou', 'add', 'port', str(FOU_PORT), 'ipproto', '4', 'local', str(fou_ip)]
     # if FOU_REMOTE_IP and FOU_REMOTE_PORT:  # Establish connection
-    #     cmd += ('peer', FOU_REMOTE_IP, 'peer_port', FOU_REMOTE_PORT)
+    #     cmd.extend(('peer', FOU_REMOTE_IP, 'peer_port', FOU_REMOTE_PORT))
     if FOU_DEV:
-        cmd += ('dev', FOU_DEV)
+        cmd.extend(('dev', FOU_DEV))
     log.debug('call: %s', cmd)
-    p = subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
-    if p.returncode:
-        if 'RTNETLINK answers: Address already in use' in p.stderr:
+    try:
+        subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=5, check=True)
+    except subprocess.CalledProcessError as e:
+        if 'RTNETLINK answers: Address already in use' in e.stderr:
             own_fou = False
             log.warning('Seems IPIP FOU listener %s:%s%s already exists', fou_ip, FOU_PORT, '@'+FOU_DEV if FOU_DEV else '')
-        elif 'fou: unknown command ' in p.stderr:
+        elif 'fou: unknown command ' in e.stderr:
             log.warning('Unsupported "ip fou" argument(s), fallback to non-bind fou listener.')
             cmd = cmd[:cmd.index('local')]
             log.debug('call: %s', cmd)
-            p = subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
-            if p.returncode:
+            try:
+                subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=5, check=True)
+            except subprocess.CalledProcessError as e:
                 own_fou = False
-                if 'RTNETLINK answers: Address already in use' in p.stderr:
+                if 'RTNETLINK answers: Address already in use' in e.stderr:
                     log.warning('Seems IPIP FOU listener 0.0.0.0:%s already exists', FOU_PORT)
                 else:
-                    log.error('Failed to create IPIP FOU listener 0.0.0.0:%s: %s', FOU_PORT, p.stderr)
+                    log.error('Failed to create IPIP FOU listener 0.0.0.0:%s: %s', FOU_PORT, e.stderr)
                     return False
+            except Exception as e:
+                log.error('Failed to create IPIP FOU listener 0.0.0.0:%s: %s', FOU_PORT, e)
+                return False
             else:
                 own_fou = True
                 ip_fou_unsupported_local = True  # Remember support status for next calls
                 log.debug('Added IPIP FOU listener 0.0.0.0:%s', FOU_PORT)
         else:
             own_fou = False
-            log.error('Failed to create IPIP FOU listener %s:%s%s: %s', fou_ip, FOU_PORT, '@'+FOU_DEV if FOU_DEV else '', p.stderr)
+            log.error('Failed to create IPIP FOU listener %s:%s%s: %s', fou_ip, FOU_PORT, '@'+FOU_DEV if FOU_DEV else '', e.stderr)
             return False
+    except Exception as e:
+        own_fou = False
+        log.error('Failed to create IPIP FOU listener %s:%s%s: %s', fou_ip, FOU_PORT, '@'+FOU_DEV if FOU_DEV else '', e)
+        return False
     else:
         own_fou = True
         ip_fou_unsupported_local = False  # Remember support status for next calls
@@ -756,81 +820,91 @@ def ipipou_create():
         cmd.append('encap-csum')
     elif ENCAP_CSUM is False:
         cmd.append('noencap-csum')
-    cmd += ('mode', 'ipip')
+    cmd.extend(('mode', 'ipip'))
     if FOU_DEV:
-        cmd += ('dev', FOU_DEV)
+        cmd.extend(('dev', FOU_DEV))
     log.debug('call: %s', cmd)
-    p = subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
-    if p.returncode == 0:
-        log.debug('%s created', TUNL_DEV)
-    elif 'RTNETLINK answers: File exists' in p.stderr \
-    and fou_ip == FOU_IP_MAIN:
-        # Failed to create tunnel, most probably because the tunnel with the same
-        # pair FOU_IP_MAIN,FOU_REMOTE_IP already exists (e.g. if clients behind NAT), so
-        # using alternate local IP with DNAT.
-        log.warning('Failed to create %s directly using FOU local IP %s, trying to use alt %s.', TUNL_DEV, fou_ip, FOU_IP_ALT)
-        fou_ip = FOU_IP_ALT
+    try:
+        subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=3, check=True)
+    except subprocess.CalledProcessError as e:
+        if 'RTNETLINK answers: File exists' in e.stderr \
+        and fou_ip == FOU_IP_MAIN:
+            # Failed to create tunnel, most probably because the tunnel with the same
+            # pair FOU_IP_MAIN,FOU_REMOTE_IP already exists (e.g. if clients behind NAT), so
+            # using alternate local IP with DNAT.
+            log.warning('Failed to create %s directly using FOU local IP %s, trying to use alt %s.', TUNL_DEV, fou_ip, FOU_IP_ALT)
+            fou_ip = FOU_IP_ALT
+        else:
+            log.error('Failed to create %s using FOU local IP %s: %s', TUNL_DEV, fou_ip, e.stderr)
+            returncode = 52  # ip_link error exit code
+            return False
     else:
-        log.error('Failed to create %s using FOU local IP %s: %s', TUNL_DEV, fou_ip, p.stderr)
-        returncode = exit_codes['ip_link']
-        return False
+        log.debug('%s created', TUNL_DEV)
 
     if fou_ip == FOU_IP_ALT:
         # Change to private mapped IP
         cmd[cmd.index(str(FOU_IP_MAIN))] = str(fou_ip)
         log.debug('call: %s', cmd)
-        p = subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
-        if p.returncode:
-            log.error('Failed to create alternate %s using FOU local IP %s: %s', TUNL_DEV, fou_ip, p.stderr)
-            returncode = exit_codes['ip_link']
+        try:
+            subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=3, check=True)
+        except subprocess.CalledProcessError as e:
+            log.error('Failed to create alternate %s using FOU local IP %s: %s', TUNL_DEV, fou_ip, e.stderr)
+            returncode = 52  # ip_link error exit code
             return False
-        log.debug('%s created', TUNL_DEV)
+        else:
+            log.debug('%s created', TUNL_DEV)
 
         # DNAT rule for mapping
         cmd = ['nft', '--', 'add', 'rule', 'ip', NFT_TABLE, 'nat-prerouting']
         if FOU_DEV:
-            cmd += ('iifname', '"%s"' % FOU_DEV)
-        cmd += ('ip', 'daddr', str(FOU_IP_MAIN), 'udp', 'dport', str(FOU_PORT),
+            cmd.extend(('iifname', '"%s"' % FOU_DEV))
+        cmd.extend(('ip', 'daddr', str(FOU_IP_MAIN), 'udp', 'dport', str(FOU_PORT),
             # Required for FOU_REMOTE_IP:FOU_REMOTE_PORT update lately
             'ip', 'saddr', str(FOU_REMOTE_IP), 'udp', 'sport', str(FOU_REMOTE_PORT),
-        )
+        ))
         if NFT_COUNTER:
             cmd.append('counter')
-        cmd += ('dnat', 'to', str(FOU_IP_ALT))
+        cmd.extend(('dnat', 'to', str(FOU_IP_ALT)))
         log.debug('call: %s', cmd)
-        p = subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
-        if p.returncode:
-            log.error('Failed to add DNAT rule for alt FOU local IP: %s', p.stderr)
-            returncode = exit_codes['nftables']
+        try:
+            subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=3, check=True)
+        except subprocess.CalledProcessError as e:
+            log.error('Failed to add DNAT rule for alt FOU local IP: %s', e.stderr)
+            returncode = 40  # nftables error exit code
             return False
-        log.debug('Added DNAT rule for alt FOU local IP')
+        else:
+            log.debug('Added DNAT rule for alt FOU local IP')
 
         # SNAT rule for mapping (required if incoming connection expired or conntrack disabled)
         cmd = ['nft', '--', 'add', 'rule', 'ip', NFT_TABLE, 'nat-postrouting']
         if FOU_DEV:
-            cmd += ('oifname', '"%s"' % FOU_DEV)
-        cmd += ('ip', 'saddr', str(FOU_IP_ALT), 'udp', 'sport', str(FOU_PORT))
+            cmd.extend(('oifname', '"%s"' % FOU_DEV))
+        cmd.extend(('ip', 'saddr', str(FOU_IP_ALT), 'udp', 'sport', str(FOU_PORT)))
         if NFT_COUNTER:
             cmd.append('counter')
-        cmd += ('snat', 'to', str(FOU_IP_MAIN))
+        cmd.extend(('snat', 'to', str(FOU_IP_MAIN)))
         log.debug('call: %s', cmd)
-        p = subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
-        if p.returncode:
-            log.error('Failed to add SNAT rule for alt FOU local IP: %s', p.stderr)
-            returncode = exit_codes['nftables']
+        try:
+            subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=3, check=True)
+        except subprocess.CalledProcessError as e:
+            log.error('Failed to add SNAT rule for alt FOU local IP: %s', e.stderr)
+            returncode = 40  # nftables error exit code
             return False
+        else:
+            log.debug('Added SNAT rule for alt FOU local IP')
 
         # Add mapped FOU local IP if not yet present
         cmd = ('ip', 'address', 'add', str(FOU_IP_ALT), 'scope', 'global', 'dev', FOU_DEV or fou_dev)
         log.debug('call: %s', cmd)
-        p = subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
-        if p.returncode:
+        try:
+            subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=3, check=True)
+        except subprocess.CalledProcessError as e:
             own_fou_ip_alt = False
-            if 'RTNETLINK answers: File exists' in p.stderr:
+            if 'RTNETLINK answers: File exists' in e.stderr:
                 log.warning('Seems alt IP %s already assigned to %s', FOU_IP_ALT, FOU_DEV or fou_dev)
             else:
-                log.error('Failed to add alt IP %s to %s: %s', FOU_IP_ALT, FOU_DEV or fou_dev, p.stderr)
-                returncode = exit_codes['ip_address']
+                log.error('Failed to add alt IP %s to %s: %s', FOU_IP_ALT, FOU_DEV or fou_dev, e.stderr)
+                returncode = 51  # ip_address error exit code
                 return False
         else:
             own_fou_ip_alt = True
@@ -838,28 +912,32 @@ def ipipou_create():
 
     # Create fou listener if does not exist
     if not fou_listener_create():
-        returncode = exit_codes['ip_fou']
+        returncode = 53  # ip_fou error exit code
         return False
 
     # Assign IP to TUNL_DEV
     cmd = ('ip', 'address', 'add', str(TUNL_IP), 'peer', str(TUNL_PEER_IP), 'dev', TUNL_DEV)
     log.debug('call: %s', cmd)
-    p = subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
-    if p.returncode:
-        log.error('Failed to assign IP to %s: %s', TUNL_DEV, p.stderr)
-        returncode = exit_codes['ip_address']
+    try:
+        subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=3, check=True)
+    except subprocess.CalledProcessError as e:
+        log.error('Failed to assign IP to %s: %s', TUNL_DEV, e.stderr)
+        returncode = 51  # ip_address error exit code
         return False
-    log.debug('Assigned IP to %s: %s/%s', TUNL_DEV, TUNL_IP, TUNL_PEER_IP)
+    else:
+        log.debug('Assigned IP to %s: %s/%s', TUNL_DEV, TUNL_IP, TUNL_PEER_IP)
 
     # Bring up TUNL_DEV
     cmd = ('ip', 'link', 'set', TUNL_DEV, 'up')
     log.debug('call: %s', cmd)
-    p = subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
-    if p.returncode:
-        log.error('Failed to bring up %s: %s', TUNL_DEV, p.stderr)
-        returncode = exit_codes['ip_link']
+    try:
+        subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=3, check=True)
+    except subprocess.CalledProcessError as e:
+        log.error('Failed to bring up %s: %s', TUNL_DEV, e.stderr)
+        returncode = 52  # ip_link error exit code
         return False
-    log.debug('%s brought up', TUNL_DEV)
+    else:
+        log.debug('%s brought up', TUNL_DEV)
 
     log.info('Setup completed for %s%s: %s:%s<->%s:%s', TUNL_DEV, '@'+FOU_DEV if FOU_DEV else '', fou_ip, FOU_PORT, FOU_REMOTE_IP, FOU_REMOTE_PORT)
 
@@ -878,101 +956,117 @@ def ipipou_update():
         'encap', 'fou', 'encap-sport', str(FOU_PORT), 'encap-dport', str(FOU_REMOTE_PORT),
     ]
     log.debug('call: %s', cmd)
-    p = subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
-    if p.returncode == 0:
-        log.info('%s updated to use new FOU remote %s:%s', TUNL_DEV, FOU_REMOTE_IP, FOU_REMOTE_PORT)
-    elif 'RTNETLINK answers: File exists' in p.stderr \
-    and fou_ip == FOU_IP_MAIN:
-        # Failed to update tunnel directly, most probably because tunnel with the same new
-        # pair FOU_IP_MAIN,FOU_REMOTE_IP already exists, so reconfigure to use
-        # alternate local IP with DNAT.
-        log.warning('Failed to update %s directly using FOU local IP %s, trying to use alt %s.', TUNL_DEV, fou_ip, FOU_IP_ALT)
-        fou_ip = FOU_IP_ALT
+    try:
+        subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=3, check=True)
+    except subprocess.CalledProcessError as e:
+        if 'RTNETLINK answers: File exists' in e.stderr \
+        and fou_ip == FOU_IP_MAIN:
+            # Failed to update tunnel directly, most probably because tunnel with the same new
+            # pair FOU_IP_MAIN,FOU_REMOTE_IP already exists, so reconfigure to use
+            # alternate local IP with DNAT.
+            log.warning('Failed to update %s directly using FOU local IP %s, trying to use alt %s.', TUNL_DEV, fou_ip, FOU_IP_ALT)
+            fou_ip = FOU_IP_ALT
 
-        # Update tunnel using FOU_IP_ALT
-        cmd += ('local', str(fou_ip))
-        log.debug('call: %s', cmd)
-        p = subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
-        if p.returncode:
-            log.error('Failed to update %s%s using alt FOU local IP: %s:%s<->%s:%s : %s', TUNL_DEV, '@'+FOU_DEV if FOU_DEV else '', fou_ip, FOU_PORT, FOU_REMOTE_IP, FOU_REMOTE_PORT, p.stderr)
-            returncode = exit_codes['ip_link']
-            return False
-        log.info('%s%s updated using new remote with alt FOU local IP: %s:%s<->%s:%s', TUNL_DEV, '@'+FOU_DEV if FOU_DEV else '', fou_ip, FOU_PORT, FOU_REMOTE_IP, FOU_REMOTE_PORT)
-
-        # DNAT will be added below
-        # Create SNAT rule for mapping (required if incoming connection expired or conntrack disabled)
-        cmd = ['nft', '--', 'add', 'rule', 'ip', NFT_TABLE, 'nat-postrouting']
-        if FOU_DEV:
-            cmd += ('oifname', '"%s"' % FOU_DEV)
-        cmd += ('ip', 'saddr', str(FOU_IP_ALT), 'udp', 'sport', str(FOU_PORT))
-        if NFT_COUNTER:
-            cmd.append('counter')
-        cmd += ('snat', 'to', str(FOU_IP_MAIN))
-        log.debug('call: %s', cmd)
-        p = subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
-        if p.returncode:
-            log.error('Failed to add SNAT rule for alt FOU local IP: %s', p.stderr)
-            returncode = exit_codes['nftables']
-            return False
-        log.debug('Added SNAT rule for alt FOU local IP')
-
-        # Add mapped FOU local IP if not yet present
-        cmd = ('ip', 'address', 'add', str(FOU_IP_ALT), 'scope', 'global', 'dev', FOU_DEV or fou_dev)
-        log.debug('call: %s', cmd)
-        p = subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
-        if p.returncode:
-            if 'RTNETLINK answers: File exists' in p.stderr:
-                log.warning('Seems alt IP %s already assigned to %s', FOU_IP_ALT, FOU_DEV or fou_dev)
-            else:
-                log.error('Failed to add alt IP %s to %s: %s', FOU_IP_ALT, FOU_DEV or fou_dev, p.stderr)
-                returncode = exit_codes['ip_address']
-                return False
-        else:
-            log.debug('Added alt IP %s to %s', FOU_IP_ALT, FOU_DEV or fou_dev)
-
-        # Update FOU listener
-
-        # Delete old if was created by this script
-        if own_fou:
-            cmd = ['ip', 'fou', 'del', 'port', str(FOU_PORT)]
-            if not ip_fou_unsupported_local:
-                cmd += ('local', str(FOU_IP_MAIN))
-                # if FOU_REMOTE_IP and FOU_REMOTE_PORT:
-                #     cmd += ('peer', str(FOU_REMOTE_IP), 'peer_port', str(FOU_REMOTE_PORT))
-                if FOU_DEV:
-                    cmd += ('dev', FOU_DEV)
+            # Update tunnel using FOU_IP_ALT
+            cmd.extend(('local', str(fou_ip)))
             log.debug('call: %s', cmd)
-            p = subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
-            if p.returncode:
-                log.warning('Failed to delete old FOU listener %s:%s%s', FOU_IP_MAIN, FOU_PORT, '@'+FOU_DEV if FOU_DEV else '')
-            else:
-                log.debug('Deleted old FOU listener %s:%s%s', FOU_IP_MAIN, FOU_PORT, '@'+FOU_DEV if FOU_DEV else '')
-
-        # Create replacement
-        cmd = ['ip', 'fou', 'add', 'port', str(FOU_PORT), 'ipproto', '4']
-        if not ip_fou_unsupported_local:
-            cmd += ('local', str(fou_ip))
-            # if FOU_REMOTE_IP and FOU_REMOTE_PORT:  # Establish connection
-            #     cmd += ('peer', FOU_REMOTE_IP, 'peer_port', FOU_REMOTE_PORT)
-            if FOU_DEV:
-                cmd += ('dev', FOU_DEV)
-        log.debug('call: %s', cmd)
-        p = subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
-        if p.returncode:
-            own_fou = False
-            if 'RTNETLINK answers: Address already in use' in p.stderr:
-                log.warning('Seems IPIP FOU listener %s:%s%s already exists', fou_ip, FOU_PORT, '@'+FOU_DEV if FOU_DEV else '')
-            else:
-                log.error('Failed to create replacement IPIP FOU listener %s:%s%s: %s', fou_ip, FOU_PORT, '@'+FOU_DEV if FOU_DEV else '', p.stderr)
-                returncode = exit_codes['ip_fou']
+            try:
+                subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=3, check=True)
+            except subprocess.CalledProcessError as e:
+                log.error('Failed to update %s%s using alt FOU local IP: %s:%s<->%s:%s : %s',
+                    TUNL_DEV, '@'+FOU_DEV if FOU_DEV else '',
+                    fou_ip, FOU_PORT, FOU_REMOTE_IP, FOU_REMOTE_PORT,
+                    e.stderr,
+                )
+                returncode = 52  # ip_link error exit code
                 return False
+            else:
+                log.info('%s%s updated using new remote with alt FOU local IP: %s:%s<->%s:%s',
+                    TUNL_DEV, '@'+FOU_DEV if FOU_DEV else '',
+                    fou_ip, FOU_PORT, FOU_REMOTE_IP, FOU_REMOTE_PORT,
+                )
+
+            # DNAT will be added below
+            # Create SNAT rule for mapping (required if incoming connection expired or conntrack disabled)
+            cmd = ['nft', '--', 'add', 'rule', 'ip', NFT_TABLE, 'nat-postrouting']
+            if FOU_DEV:
+                cmd.extend(('oifname', '"%s"' % FOU_DEV))
+            cmd.extend(('ip', 'saddr', str(FOU_IP_ALT), 'udp', 'sport', str(FOU_PORT)))
+            if NFT_COUNTER:
+                cmd.append('counter')
+            cmd.extend(('snat', 'to', str(FOU_IP_MAIN)))
+            log.debug('call: %s', cmd)
+            try:
+                subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=3, check=True)
+            except subprocess.CalledProcessError as e:
+                log.error('Failed to add SNAT rule for alt FOU local IP: %s', e.stderr)
+                returncode = 40  # nftables error exit code
+                return False
+            else:
+                log.debug('Added SNAT rule for alt FOU local IP')
+
+            # Add mapped FOU local IP if not yet present
+            cmd = ('ip', 'address', 'add', str(FOU_IP_ALT), 'scope', 'global', 'dev', FOU_DEV or fou_dev)
+            log.debug('call: %s', cmd)
+            try:
+                subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=3, check=True)
+            except subprocess.CalledProcessError as e:
+                if 'RTNETLINK answers: File exists' in e.stderr:
+                    log.warning('Seems alt IP %s already assigned to %s', FOU_IP_ALT, FOU_DEV or fou_dev)
+                else:
+                    log.error('Failed to add alt IP %s to %s: %s', FOU_IP_ALT, FOU_DEV or fou_dev, e.stderr)
+                    returncode = 51  # ip_address error exit code
+                    return False
+            else:
+                log.debug('Added alt IP %s to %s', FOU_IP_ALT, FOU_DEV or fou_dev)
+
+            # Update FOU listener
+
+            # Delete old if was created by this script
+            if own_fou:
+                cmd = ['ip', 'fou', 'del', 'port', str(FOU_PORT)]
+                if not ip_fou_unsupported_local:
+                    cmd.extend(('local', str(FOU_IP_MAIN)))
+                    # if FOU_REMOTE_IP and FOU_REMOTE_PORT:
+                    #     cmd.extend(('peer', str(FOU_REMOTE_IP), 'peer_port', str(FOU_REMOTE_PORT)))
+                    if FOU_DEV:
+                        cmd.extend(('dev', FOU_DEV))
+                log.debug('call: %s', cmd)
+                try:
+                    subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=3, check=True)
+                except subprocess.CalledProcessError as e:
+                    log.warning('Failed to delete old FOU listener %s:%s%s : %s', FOU_IP_MAIN, FOU_PORT, '@'+FOU_DEV if FOU_DEV else '', e.stderr)
+                else:
+                    log.debug('Deleted old FOU listener %s:%s%s', FOU_IP_MAIN, FOU_PORT, '@'+FOU_DEV if FOU_DEV else '')
+
+            # Create replacement
+            cmd = ['ip', 'fou', 'add', 'port', str(FOU_PORT), 'ipproto', '4']
+            if not ip_fou_unsupported_local:
+                cmd.extend(('local', str(fou_ip)))
+                # if FOU_REMOTE_IP and FOU_REMOTE_PORT:  # Establish connection
+                #     cmd.extend(('peer', FOU_REMOTE_IP, 'peer_port', FOU_REMOTE_PORT))
+                if FOU_DEV:
+                    cmd.extend(('dev', FOU_DEV))
+            log.debug('call: %s', cmd)
+            try:
+                subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=3, check=True)
+            except subprocess.CalledProcessError as e:
+                own_fou = False
+                if 'RTNETLINK answers: Address already in use' in e.stderr:
+                    log.warning('Seems IPIP FOU listener %s:%s%s already exists', fou_ip, FOU_PORT, '@'+FOU_DEV if FOU_DEV else '')
+                else:
+                    log.error('Failed to create replacement IPIP FOU listener %s:%s%s : %s', fou_ip, FOU_PORT, '@'+FOU_DEV if FOU_DEV else '', e.stderr)
+                    returncode = 53  # ip_fou error exit code
+                    return False
+            else:
+                own_fou = True
+                log.debug('Added replacement IPIP FOU listener %s:%s%s', fou_ip, FOU_PORT, '@'+FOU_DEV if FOU_DEV else '')
         else:
-            own_fou = True
-            log.debug('Added replacement IPIP FOU listener %s:%s%s', fou_ip, FOU_PORT, '@'+FOU_DEV if FOU_DEV else '')
+            log.error('Failed to update %s%s %s:%s<->%s:%s : %s', TUNL_DEV, '@'+FOU_DEV if FOU_DEV else '', fou_ip, FOU_PORT, FOU_REMOTE_IP, FOU_REMOTE_PORT, e.stderr)
+            returncode = 52  # ip_link error exit code
+            return False
     else:
-        log.error('Failed to update %s%s %s:%s<->%s:%s : %s', TUNL_DEV, '@'+FOU_DEV if FOU_DEV else '', fou_ip, FOU_PORT, FOU_REMOTE_IP, FOU_REMOTE_PORT, p.stderr)
-        returncode = exit_codes['ip_link']
-        return False
+        log.info('%s updated to use new FOU remote %s:%s', TUNL_DEV, FOU_REMOTE_IP, FOU_REMOTE_PORT)
 
     if fou_ip == FOU_IP_ALT:
         # Create or update DNAT rule
@@ -988,20 +1082,22 @@ def ipipou_update():
         else:  # Update/replace existing
             cmd = ['nft', '--', 'replace', 'rule', 'ip', NFT_TABLE, 'nat-prerouting', 'handle', handle_num]
         if FOU_DEV:
-            cmd += ('iifname', '"%s"' % FOU_DEV)
-        cmd += ('ip', 'daddr', str(FOU_IP_MAIN), 'udp', 'dport', str(FOU_PORT),
+            cmd.extend(('iifname', '"%s"' % FOU_DEV))
+        cmd.extend(('ip', 'daddr', str(FOU_IP_MAIN), 'udp', 'dport', str(FOU_PORT),
             'ip', 'saddr', str(FOU_REMOTE_IP), 'udp', 'sport', str(FOU_REMOTE_PORT),
-        )
+        ))
         if NFT_COUNTER:
             cmd.append('counter')
-        cmd += ('dnat', 'to', str(FOU_IP_ALT))
+        cmd.extend(('dnat', 'to', str(FOU_IP_ALT)))
         log.debug('call: %s', cmd)
-        p = subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
-        if p.returncode:
-            log.error('Failed to update DNAT rule for alt FOU local IP: %s', p.stderr)
-            returncode = exit_codes['nftables']
+        try:
+            subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=3, check=True)
+        except subprocess.CalledProcessError as e:
+            log.error('Failed to update DNAT rule for alt FOU local IP: %s', e.stderr)
+            returncode = 40  # nftables error exit code
             return False
-        log.debug('Updated DNAT rule for alt FOU local IP')
+        else:
+            log.debug('Updated DNAT rule for alt FOU local IP')
 
     # # Delete old connection if any
     # cmd = ('conntrack', '--delete',
@@ -1024,7 +1120,9 @@ def ipipou_update():
 
 
 def ipipou_delete():
-    '''Deconfigure and delete ipipou tunnel'''
+    '''
+    Deconfigure and delete ipipou tunnel
+    '''
     rval = True
 
     # Delete tunnel interface
@@ -1035,9 +1133,10 @@ def ipipou_delete():
     ):
         cmd = ('ip', 'link', 'del', TUNL_DEV)
         log.debug('call: %s', cmd)
-        p = subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
-        if p.returncode:
-            log.warning('Failed to delete %s: %s', TUNL_DEV, p.stderr)
+        try:
+            subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=3, check=True)
+        except subprocess.CalledProcessError as e:
+            log.warning('Failed to delete %s: %s', TUNL_DEV, e.stderr)
             rval = False
         else:
             log.debug('%s deleted', TUNL_DEV)
@@ -1048,15 +1147,16 @@ def ipipou_delete():
     if own_fou and fou_ip:
         cmd = ['ip', 'fou', 'del', 'port', str(FOU_PORT)]
         if not ip_fou_unsupported_local:
-            cmd += ('local', str(fou_ip))
+            cmd.extend(('local', str(fou_ip)))
             # if FOU_REMOTE_IP and FOU_REMOTE_PORT:
-            #     cmd += ('peer', str(FOU_REMOTE_IP), 'peer_port', str(FOU_REMOTE_PORT))
+            #     cmd.extend(('peer', str(FOU_REMOTE_IP), 'peer_port', str(FOU_REMOTE_PORT)))
             if FOU_DEV:
-                cmd += ('dev', FOU_DEV)
+                cmd.extend(('dev', FOU_DEV))
         log.debug('call: %s', cmd)
-        p = subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
-        if p.returncode:
-            log.warning('Failed to delete FOU listener %s:%s%s: %s', fou_ip, FOU_PORT, '@'+FOU_DEV if FOU_DEV else '', p.stderr)
+        try:
+            subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=3, check=True)
+        except subprocess.CalledProcessError as e:
+            log.warning('Failed to delete FOU listener %s:%s%s: %s', fou_ip, FOU_PORT, '@'+FOU_DEV if FOU_DEV else '', e.stderr)
             rval = False
         else:
             log.debug('FOU listener %s:%s%s deleted', fou_ip, FOU_PORT, '@'+FOU_DEV if FOU_DEV else '')
@@ -1071,9 +1171,10 @@ def ipipou_delete():
                 if ip == '%s/32' % FOU_IP_ALT:
                     cmd = ('ip', 'address', 'delete', ip, 'dev', FOU_DEV or fou_dev)
                     log.debug('call: %s', cmd)
-                    p = subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
-                    if p.returncode:
-                        log.warning('Failed to delete FOU alt IP %s from %s: %s', FOU_IP_ALT, FOU_DEV or fou_dev, p.stderr)
+                    try:
+                        subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=3, check=True)
+                    except subprocess.CalledProcessError as e:
+                        log.warning('Failed to delete FOU alt IP %s from %s: %s', FOU_IP_ALT, FOU_DEV or fou_dev, e.stderr)
                         rval = False
                     else:
                         log.debug('FOU alt IP %s deleted from %s', FOU_IP_ALT, FOU_DEV or fou_dev)
@@ -1091,10 +1192,12 @@ def ipipou_delete():
                     cmd = ('nft', '--', 'delete', 'rule', 'ip', NFT_TABLE, 'nat-postrouting', 'handle', l[l.rfind(' ')+1:])
                 else:
                     continue
+
                 log.debug('call: %s', cmd)
-                p = subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
-                if p.returncode:
-                    log.warning('Failed to delete nftables rule: %s: %s', l.lstrip(), p.stderr)
+                try:
+                    subprocess.run(cmd, universal_newlines=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=3, check=True)
+                except subprocess.CalledProcessError as e:
+                    log.warning('Failed to delete nftables rule: %s: %s', l.lstrip(), e.stderr)
                     rval = False
                 else:
                     log.debug('nftables rule deleted: %s', l.lstrip())
@@ -1382,7 +1485,7 @@ if __name__ == '__main__':
             parser.error('unsupported AUTH_KEY_TYPE: %s' % AUTH_KEY_TYPE)
 
     if (AUTH_KEY or AUTH_REMOTE_PUBKEY) and AUTH_SECRET == b'netprickle.com':
-        log.warning('Default AUTH_SECRET in use, change it on both sides for higher security.')
+        log.warning('Default AUTH_SECRET is in use, change it on both sides for higher security.')
 
     if FOU_DEV or FOU_IP_MAIN:
         pass
@@ -1445,7 +1548,7 @@ if __name__ == '__main__':
             NFQ_NUM = N
         if not 0 <= NFQ_NUM <= 65535:
             parser.error('NFQ_NUM is out of range 0-65535: {}'.format(NFQ_NUM))
-        if N == 0 and 0 < NFQ_NUM <= 999:
+        if N == 0 and (0 < NFQ_NUM <= 999):
             N = NFQ_NUM
 
         # if FORCE_FOU_IP_ALT and not FOU_IP_ALT:
@@ -1510,12 +1613,13 @@ if __name__ == '__main__':
     # TODO: (?) convert IPs from IPv4Address back to str notation
 
     # Cleanup some stuff which is not required anymore
-    del argparse
     del parser
+    del argparse
     del AUTH_KEYGEN
     del FOU_LOCAL
     del FOU_REMOTE
     del i
+    gc.collect()
 
     prerequisites()
 
@@ -1526,7 +1630,7 @@ if __name__ == '__main__':
     elif MODE == 'client':
         if REAUTH_ONLY:  # Short running.
             if not client_auth():
-                returncode = exit_codes['send_auth']
+                returncode = 120  # send_auth error exit code
         else:
             # Main long running function
             client_init(monitor=False)

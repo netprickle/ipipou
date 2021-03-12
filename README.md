@@ -19,20 +19,20 @@ IPIP-over-UDP in general and this tool in particular has some advantages over pu
 
 - It's possible to create such tunnel even if some host is behind NAT (pure IPIP requires public IPs on both sides). Sometimes it's possible to create it when both sides are behind NAT (using stun and other techniques: not supported by this tool yet).
 
-- Authentication support for remote IP:port connection. It's useful if one of hosts is behind NAT.
+- Authentication support for remote IP:port connection. It's useful if one of the hosts is behind NAT.
 
 - Multiple tunnels can be created between the same public IPs pair (e.g. when multiple clients share the same public IP). To support it this implementation relies on local NAT configuration using additional private IP. In the future Linux may start to support [creating FOU tunnels to the same destination IP but different port](https://www.mail-archive.com/netdev@vger.kernel.org/msg228687.html) natively without this NAT hack, or may not...
 
 - Live roaming support. Client side of connection may change its public IP and/or port, after [re]authentication packet tunnel will be reconfigured to use updated IP:port (WireGuard behaves similar way).
 
-In comparison with encrypted tunnels (like WireGuard) IPIP-over-UDP has lower overhead and going to have higher throughput, lower latency and CPU usage, while still supports weak authentication. It can be better choice than WireGuard when tunnel level encryption is not required and better to be avoided, e.g. if inner layer going to be encrypted itself (https, ssh, vpn, etc.), or you prefer performance over security.
+In comparison with encrypted tunnels (like WireGuard) IPIP-over-UDP has lower overhead and going to have higher throughput, lower latency and CPU usage, while still supports weak authentication. It can be better choice than WireGuard when tunnel level encryption is not required and better to be avoided, e.g. if inner layer going to be encrypted itself (HTTPS, SSH, VPN, etc.), or you prefer performance over security.
 
 Nevertheless as opposed to WireGuard FOU supported by Linux only AFAIK.
 
 
 ## Requirements
 
-Linux4.15+ (not tested with lower versions, 5.4+ recommended) built with support of IPIP and FOU, nftables, netfilter queue, python3.6+ (not tested with lower versions).
+Linux 4.15+ (not tested with lower versions, 5.4+ recommended) built with support of IPIP and FOU, nftables, netfilter queue, python 3.6+ (not tested with lower versions).
 
 Internally `ipipou` tool relies on the following binaries: `ip`, `nft` for server mode, optionally `modprobe` and `conntrack`
 
